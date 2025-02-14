@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>
+      Bry.io
+    </title>
+    <style>
+      /* The page background remains blue so that the area outside the map appears blue. */
+      body {
+        margin: 0;
+        overflow: hidden;
+        background: blue;
+      }
+      /* The main game canvas now has no CSS border; we draw the circular map border manually. */
+      #gameCanvas {
+        display: block;
+        background: transparent;
+        margin: 0px auto;
+      }
+      /* The minimap canvas: remove any CSS border or background */
+      #minimap {
+        position: absolute;
+        bottom: 10px;
+        left: 10px;
+        background: transparent;
+      }
+      /* Scoreboard remains at top right */
+      #scoreboard {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        color: white;
+        font-family: sans-serif;
+        font-size: 14px;
+        background: rgba(0, 0, 0, 0.5);
+        padding: 5px;
+        border-radius: 5px;
+      }
+      /* Kill counter at top left */
+      #killCounter {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        color: white;
+        font-family: sans-serif;
+        font-size: 14px;
+        background: rgba(0, 0, 0, 0.5);
+        padding: 5px;
+        border-radius: 5px;
+      }
+      /* Restart button, positioned below Game Over text */
+      #restartButton {
+        position: absolute;
+        top: calc(50% + 60px);
+        left: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 20px;
+        padding: 10px 20px;
+        background: #FFF;
+        border: 2px solid #000;
+        cursor: pointer;
+        display: none;
+      }
+    </style>
+    <!-- Include clipper.js in the main window (for non-worker operations) -->
+    <script src="https://supervene.com/bry.io/clipper.js"></script>
+  </head>
+  <body>
+    <canvas id="gameCanvas"></canvas>
+    <canvas id="minimap" width="200" height="200"></canvas>
+    <div id="scoreboard"></div>
+    <div id="killCounter"></div>
+    <button id="restartButton">Restart</button>
+    <script>
+      // ===== CONFIGURATION VARIABLES =====
+      const MAP_RADIUS = 800;             // Overall map radius (pixels)
+      const INITIAL_PLOT_RADIUS = 100;       // Starting territory radius
+      const PLAYER_SPEED = 150;            // Base speed (pixels per second)
+      const BORDER_MARGIN = 50;            // Margin inside the map for spawning
+      const CIRCLE_SEGMENTS = 20;          // Reduced segments for circles (was 40)
+      const WIN_THRESHOLD = 0.95;          // Fraction of map area claimed to win
+      const TRAIL_WIDTH = 15;              // Trail width (pixels)
+      const TRAIL_ALPHA = 0.5;             // Trail transparency (0.0–1.0)
+
+      const BOT_COUNT = 5;               // Desired number of bot players
+      const MIN_FREE_AREA_RATIO = 0.10;    // Bots spawn only if at least 10% of the map is unclaimed
+
+      // Clipper/union parameters:
+      const CLIPPER_SCALE = 1000;         // Scale factor for Clipper
+      const UNION_COOLDOWN = 1000;       // Increased cooldown to 1000 ms (was 500)
+      const MIN_TRAIL_POINTS_FOR_UNION = 5;  // Increased minimum trail points (was 2)
+
+      // Avoidance parameters:
+      const AVOIDANCE_RADIUS = 150;      // Distance threshold for avoidance (pixels)
+
+      // Collision parameters:
+      const COLLISION_THRESHOLD = 5;     // Collision threshold (pixels)
+      const TRAIL_IGNORE_COUNT = 10;     // Number of most-recent trail points to ignore
+
+      // Bot bias and behavior parameters:
+      const BOT_RETURN_BIAS = 0.4;       // Weight for vector toward own plot
+      const BOT_PERP_BIAS = 0.8;         // Weight for perpendicular (curved) bias
+      const BOT_EXIT_PROB = 0.2;         // Chance per frame a bot will exit its plot
+      const TRAIL_ATTRACTION_DISTANCE = 150; // Distance threshold for bot attraction to opponent trails
+      const TRAIL_ATTRACTION_WEIGHT = 0.5;     // Weight for trail attraction vector
+      const BOT_SMOOTHING = 0.1;         // Smoothing factor for bot direction changes
+
+      // ===== GLOBAL VARIABLES =====
+      let canvas, ctx, miniCtx;
+      let lastTime = performance.now();
+      let gameWon = false;
+      let killCount = 0;
+      let playerName = prompt("Enter your name:", "Player");
+      if (!playerName) playerName = "Player";
+
+      const directions = [
+        { x: 0, y: -1 },
+        { x: Math.SQRT1_2, y: -Math.SQRT1_2 },
+        { x: 1, y: 0 },
+        { x: Math.SQRT1_2, y: Math.SQRT1_2 },
+        { x: 0, y: 1 },
+        { x: -Math.SQRT1_2, y: Math.SQRT1_2 },
+        { x: -1, y: 0 },
+        { x: -Math.SQRT1_2, y: -Math.SQRT1_2 }
+      ];
+
+      let player = {
+        pos: { x: 0, y: 0 },
+        dir: { x: 0, y: 0 },
+        speed: PLAYER_SPEED,
+        color: "",
+        name: playerName,
+        territory: [],
+        trail: [],
+        isOffTerritory: false,
+        alive: true,
+        lastUnionTime: 0,
+        kills: 0
+      };
+
+      let bots = [];
+
+      // ===== HELPER FUNCTIONS (GEOMETRY) =====
+      function getRandomStartingPosition() {
+        let r = Math.sqrt(Math.random()) * (MAP_RADIUS - BORDER_MARGIN) + BORDER_MARGIN / 2;
+        let angle = Math.random() * 2 * Math.PI;
+        return { x: r * Math.cos(angle), y: r * Math.sin(angle) };
+      }
+
+      function getRandomColor() {
+        const letters = "0123456789ABCDEF";
+        let color = "#";
+        for (let i = 0; i < 6; i++) {
+          color += letters[Math.floor(Math.random() * 16)];
+        }
+        return color;
+      }
+
+      function hexToRgba(hex, alpha) {
+        hex = hex.replace("#", "");
+        let r = parseInt(hex.substring(0, 2), 16);
+        let g = parseInt(hex.substring(2, 4), 16);
+        let b = parseInt(hex.substring(4, 6), 16);
+        return "rgba(" + r + "," + g + "," + b + "," + alpha + ")";
+      }
+
+      function hslToHex(h, s, l) {
+        s /= 100;
+        l /= 100;
+        let c = (1 - Math.abs(2 * l - 1)) * s;
+        let x = c * (1 - Math.abs((h / 60) % 2 - 1));
+        let m = l - c / 2;
+        let r, g, b;
+        if (h < 60) { r = c; g = x; b = 0; }
+        else if (h < 120) { r = x; g = c; b = 0; }
+        else if (h < 180) { r = 0; g = c; b = x; }
+        else if (h < 240) { r = 0; g = x; b = c; }
+        else if (h < 300) { r = x; g = 0; b = c; }
+        else { r = c; g = 0; b = x; }
+        r = Math.round((r + m) * 255);
+        g = Math.round((g + m) * 255);
+        b = Math.round((b + m) * 255);
+        return (
+          "#" +
+          ((1 << 24) + (r << 16) + (g << 8) + b)
+            .toString(16)
+            .slice(1)
+            .toUpperCase()
+        );
+      }
+
+      function createCirclePolygon(center, radius, numPoints) {
+        const poly = [];
+        for (let i = 0; i < numPoints; i++) {
+          const angle = (i / numPoints) * 2 * Math.PI;
+          poly.push({
+            x: center.x + radius * Math.cos(angle),
+            y: center.y + radius * Math.sin(angle)
+          });
+        }
+        return poly;
+      }
+
+      function pointInPolygon(point, polygon) {
+        let inside = false;
+        for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+          const xi = polygon[i].x, yi = polygon[i].y;
+          const xj = polygon[j].x, yj = polygon[j].y;
+          const intersect =
+            (yi > point.y) !== (yj > point.y) &&
+            point.x < ((xj - xi) * (point.y - yi)) / ((yj - yi) || 0.00001) + xi;
+          if (intersect) inside = !inside;
+        }
+        return inside;
+      }
+
+      function polygonArea(polygon) {
+        let area = 0;
+        for (let i = 0; i < polygon.length; i++) {
+          let j = (i + 1) % polygon.length;
+          area += polygon[i].x * polygon[j].y - polygon[j].x * polygon[i].y;
+        }
+        return Math.abs(area) / 2;
+      }
+
+      function totalClaimedArea(character) {
+        let area = 0;
+        character.territory.forEach(poly => {
+          area += polygonArea(poly);
+        });
+        return area;
+      }
+
+      function isClaimed(pos) {
+        const allChars = [player].concat(bots);
+        for (let ch of allChars) {
+          for (let poly of ch.territory) {
+            if (pointInPolygon(pos, poly)) return true;
+          }
+        }
+        return false;
+      }
+
+      function computeCentroid(poly) {
+        let sumX = 0, sumY = 0;
+        for (let pt of poly) {
+          sumX += pt.x;
+          sumY += pt.y;
+        }
+        return { x: sumX / poly.length, y: sumY / poly.length };
+      }
+
+      function lerpVector(v1, v2, t) {
+        return {
+          x: v1.x + (v2.x - v1.x) * t,
+          y: v1.y + (v2.y - v1.y) * t
+        };
+      }
+
+      // ===== CLIPPER FUNCTIONS (DIFFERENCE & UNION) =====
+      function differencePolygons(subjectPolys, clipPolys) {
+        let scale = CLIPPER_SCALE;
+        const subj = subjectPolys.map(poly =>
+          poly.map(pt => ({ X: Math.round(pt.x * scale), Y: Math.round(pt.y * scale) }))
+        );
+        const clip = clipPolys.map(poly =>
+          poly.map(pt => ({ X: Math.round(pt.x * scale), Y: Math.round(pt.y * scale) }))
+        );
+        let c = new ClipperLib.Clipper();
+        c.AddPaths(subj, ClipperLib.PolyType.ptSubject, true);
+        c.AddPaths(clip, ClipperLib.PolyType.ptClip, true);
+        let solutionPaths = new ClipperLib.Paths();
+        c.Execute(
+          ClipperLib.ClipType.ctDifference,
+          solutionPaths,
+          ClipperLib.PolyFillType.pftNonZero,
+          ClipperLib.PolyFillType.pftNonZero
+        );
+        return solutionPaths.map(path =>
+          path.map(pt => ({ x: pt.X / scale, y: pt.Y / scale }))
+        );
+      }
+      // Attach to window so callbacks have access.
+      window.differencePolygons = differencePolygons;
+	  
+	  function offsetPolygons(polys, delta) {
+		let scale = CLIPPER_SCALE;
+		let co = new ClipperLib.ClipperOffset();
+		const paths = polys.map(poly =>
+			poly.map(pt => ({ X: Math.round(pt.x * scale), Y: Math.round(pt.y * scale) }))
+		);
+		co.AddPaths(paths, ClipperLib.JoinType.jtRound, ClipperLib.EndType.etClosedPolygon);
+		const newPaths = new ClipperLib.Paths();
+		co.Execute(newPaths, delta * scale);
+		return newPaths.map(path =>
+			path.map(pt => ({ x: pt.X / scale, y: pt.Y / scale }))
+		);
+	}
+  
+	function unionPolygons(existingPolys, newPoly) {
+		let scale = CLIPPER_SCALE;
+		const subj = existingPolys.map(poly =>
+			poly.map(pt => ({ X: Math.round(pt.x * scale), Y: Math.round(pt.y * scale) }))
+		);
+		const clip = [
+			newPoly.map(pt => ({ X: Math.round(pt.x * scale), Y: Math.round(pt.y * scale) }))
+		];
+		let c = new ClipperLib.Clipper();
+		c.AddPaths(subj, ClipperLib.PolyType.ptSubject, true);
+		c.AddPaths(clip, ClipperLib.PolyType.ptClip, true);
+		const solutionPaths = new ClipperLib.Paths();
+		c.Execute(
+			ClipperLib.ClipType.ctUnion,
+			solutionPaths,
+			ClipperLib.PolyFillType.pftNonZero,  // Try pftEvenOdd if needed
+			ClipperLib.PolyFillType.pftNonZero
+		);
+		let unioned = solutionPaths.map(path =>
+			path.map(pt => ({ x: pt.X / scale, y: pt.Y / scale }))
+		);
+		// Try smaller offset values (0.2 instead of 0.5)
+		unioned = offsetPolygons(unioned, 0.2);
+		unioned = offsetPolygons(unioned, -0.2);
+		return unioned;
+	}
+	  
+	  window.unionPolygons = unionPolygons; // attach to window
+
+      // ===== WEB WORKER FOR CLIPPER UNION =====
+      const workerCode = `
+        importScripts('https://supervene.com/bry.io/clipper.js');
+        function offsetPolygons(polys, delta) {
+          let scale = ${CLIPPER_SCALE};
+          let co = new ClipperLib.ClipperOffset();
+          const paths = polys.map(poly =>
+            poly.map(pt => ({ X: Math.round(pt.x * scale), Y: Math.round(pt.y * scale) }))
+          );
+          co.AddPaths(paths, ClipperLib.JoinType.jtRound, ClipperLib.EndType.etClosedPolygon);
+          const newPaths = new ClipperLib.Paths();
+          co.Execute(newPaths, delta * scale);
+          return newPaths.map(path =>
+            path.map(pt => ({ x: pt.X / scale, y: pt.Y / scale }))
+          );
+        }
+        function unionPolygons(existingPolys, newPoly) {
+          let scale = ${CLIPPER_SCALE};
+          const subj = existingPolys.map(poly =>
+            poly.map(pt => ({ X: Math.round(pt.x * scale), Y: Math.round(pt.y * scale) }))
+          );
+          const clip = [
+            newPoly.map(pt => ({ X: Math.round(pt.x * scale), Y: Math.round(pt.y * scale) }))
+          ];
+          let c = new ClipperLib.Clipper();
+          c.AddPaths(subj, ClipperLib.PolyType.ptSubject, true);
+          c.AddPaths(clip, ClipperLib.PolyType.ptClip, true);
+          const solutionPaths = new ClipperLib.Paths();
+          c.Execute(
+            ClipperLib.ClipType.ctUnion,
+            solutionPaths,
+            ClipperLib.PolyFillType.pftNonZero,
+            ClipperLib.PolyFillType.pftNonZero
+          );
+          let unioned = solutionPaths.map(path =>
+            path.map(pt => ({ x: pt.X / scale, y: pt.Y / scale }))
+          );
+          unioned = offsetPolygons(unioned, 0.5);
+          unioned = offsetPolygons(unioned, -0.5);
+          return unioned;
+        }
+        self.onmessage = function(e) {
+          const data = e.data;
+          if (data.operation === 'union') {
+            const result = unionPolygons(data.existingPolys, data.newPoly);
+            self.postMessage({id: data.id, result: result});
+          }
+        };
+      `;
+      const blob = new Blob([workerCode], { type: "application/javascript" });
+      const workerUrl = URL.createObjectURL(blob);
+      const clipperWorker = new Worker(workerUrl);
+      const clipperCallbacks = {};
+      clipperWorker.onmessage = function(e) {
+        const data = e.data;
+        if (clipperCallbacks[data.id]) {
+          clipperCallbacks[data.id](data.result);
+          delete clipperCallbacks[data.id];
+        }
+      };
+      function unionPolygonsAsync(existingPolys, newPoly) {
+        return new Promise((resolve, reject) => {
+          const id = Date.now() + Math.random();
+          clipperCallbacks[id] = resolve;
+          clipperWorker.postMessage({
+            operation: 'union',
+            existingPolys: existingPolys,
+            newPoly: newPoly,
+            id: id
+          });
+        });
+      }
+
+      // ===== BOT SPAWN FUNCTIONS =====
+      function generateUniqueBotColor() {
+        let hue;
+        let attempts = 0;
+        let usedHues = bots.filter(b => b.alive && b.hue !== undefined).map(b => b.hue);
+        do {
+          hue = Math.floor(Math.random() * 360);
+          attempts++;
+        } while (usedHues.some(existingHue => Math.abs(existingHue - hue) < 30) && attempts < 10);
+        return { color: hslToHex(hue, 80, 50), hue: hue };
+      }
+
+      function spawnBot() {
+        let botData = generateUniqueBotColor();
+        let pos;
+        let attempts = 0;
+        do {
+          pos = getRandomStartingPosition();
+          attempts++;
+        } while (isClaimed(pos) && attempts < 20);
+        let bot = {
+          pos: pos,
+          dir: { x: 0, y: 0 },
+          speed: PLAYER_SPEED * (0.8 + Math.random() * 0.4),
+          territory: [],
+          trail: [],
+          isOffTerritory: false,
+          alive: true,
+          lastUnionTime: performance.now(),
+          isBot: true,
+          aiTimer: 1 + Math.random() * 2,
+          color: botData.color,
+          hue: botData.hue,
+          name: "Bot_" + (Math.floor(1000 + Math.random() * 9000)),
+          killed: false
+        };
+        bot.territory = [createCirclePolygon(bot.pos, INITIAL_PLOT_RADIUS, CIRCLE_SEGMENTS)];
+        let angle = Math.random() * 2 * Math.PI;
+        bot.dir = { x: Math.cos(angle), y: Math.sin(angle) };
+        bots.push(bot);
+      }
+
+      function checkForBotSpawn() {
+        let aliveBots = bots.filter(bot => bot.alive).length;
+        if (aliveBots < BOT_COUNT) {
+          let playerArea = totalClaimedArea(player);
+          let botArea = bots.reduce((sum, bot) => sum + (bot.alive ? totalClaimedArea(bot) : 0), 0);
+          let claimedArea = playerArea + botArea;
+          let totalMapArea = Math.PI * MAP_RADIUS * MAP_RADIUS;
+          let freeAreaRatio = (totalMapArea - claimedArea) / totalMapArea;
+          if (freeAreaRatio >= MIN_FREE_AREA_RATIO) {
+            spawnBot();
+          }
+        }
+        let delay = 2000 + Math.random() * 8000;
+        setTimeout(checkForBotSpawn, delay);
+      }
+
+      // ===== BOT AVOIDANCE & TRAIL ATTRACTION =====
+      function botAvoidance(bot) {
+        let repulsion = { x: 0, y: 0 };
+        let others = [player].concat(bots.filter(b => b !== bot && b.alive));
+        others.forEach(other => {
+          let dx = bot.pos.x - other.pos.x;
+          let dy = bot.pos.y - other.pos.y;
+          let d = Math.hypot(dx, dy);
+          if (d < AVOIDANCE_RADIUS && d > 0) {
+            repulsion.x += (dx / d) * ((AVOIDANCE_RADIUS - d) / AVOIDANCE_RADIUS);
+            repulsion.y += (dy / d) * ((AVOIDANCE_RADIUS - d) / AVOIDANCE_RADIUS);
+          }
+        });
+        return repulsion;
+      }
+
+      function trailAttraction(bot) {
+        let attraction = { x: 0, y: 0 };
+        let others = [player].concat(bots.filter(b => b !== bot && b.alive));
+        others.forEach(other => {
+          if (other.trail.length > TRAIL_IGNORE_COUNT) {
+            for (let i = 0; i < other.trail.length - TRAIL_IGNORE_COUNT; i++) {
+              let pt = other.trail[i];
+              let dx = pt.x - bot.pos.x;
+              let dy = pt.y - bot.pos.y;
+              let d = Math.hypot(dx, dy);
+              if (d < TRAIL_ATTRACTION_DISTANCE) {
+                attraction.x += (dx / d) * ((TRAIL_ATTRACTION_DISTANCE - d) / TRAIL_ATTRACTION_DISTANCE);
+                attraction.y += (dy / d) * ((TRAIL_ATTRACTION_DISTANCE - d) / TRAIL_ATTRACTION_DISTANCE);
+              }
+            }
+          }
+        });
+        return attraction;
+      }
+
+      // ===== CHARACTER UPDATE FUNCTION =====
+	function updateCharacter(ch, dt) {
+		// Update position.
+		ch.pos.x += ch.dir.x * ch.speed * dt;
+		ch.pos.y += ch.dir.y * ch.speed * dt;
+		const dist = Math.hypot(ch.pos.x, ch.pos.y);
+		if (dist > MAP_RADIUS) {
+			let angle = Math.atan2(ch.pos.y, ch.pos.x);
+			ch.pos.x = MAP_RADIUS * Math.cos(angle);
+			ch.pos.y = MAP_RADIUS * Math.sin(angle);
+		}
+
+		// --- Bot AI and Movement ---
+		if (ch.isBot) {
+			ch.aiTimer -= dt;
+			if (ch.aiTimer <= 0) {
+				let angle = Math.random() * 2 * Math.PI;
+				ch.dir = { x: Math.cos(angle), y: Math.sin(angle) };
+				ch.aiTimer = 1 + Math.random() * 2;
+			}
+			let avoidVec = botAvoidance(ch);
+			let newDir = { x: ch.dir.x, y: ch.dir.y };
+			newDir.x += avoidVec.x;
+			newDir.y += avoidVec.y;
+			if (ch.isOffTerritory && ch.territory.length > 0) {
+				let centroid = computeCentroid(ch.territory[0]);
+				let returnVec = { x: centroid.x - ch.pos.x, y: centroid.y - ch.pos.y };
+				let norm = Math.hypot(returnVec.x, returnVec.y);
+				if (norm > 0) {
+					returnVec.x /= norm;
+					returnVec.y /= norm;
+				}
+				let perp = { x: -returnVec.y, y: returnVec.x };
+				let sign = Math.random() < 0.5 ? 1 : -1;
+				perp.x *= sign;
+				perp.y *= sign;
+				let desiredDir = {
+					x: BOT_RETURN_BIAS * returnVec.x + BOT_PERP_BIAS * perp.x,
+					y: BOT_RETURN_BIAS * returnVec.y + BOT_PERP_BIAS * perp.y
+				};
+				let dmag = Math.hypot(desiredDir.x, desiredDir.y);
+				if (dmag > 0) {
+					desiredDir.x /= dmag;
+					desiredDir.y /= dmag;
+				}
+				newDir = lerpVector(newDir, desiredDir, BOT_SMOOTHING);
+			}
+			let attr = trailAttraction(ch);
+			newDir.x += TRAIL_ATTRACTION_WEIGHT * attr.x;
+			newDir.y += TRAIL_ATTRACTION_WEIGHT * attr.y;
+			let mag = Math.hypot(newDir.x, newDir.y);
+			if (mag > 0) {
+				newDir.x /= mag;
+				newDir.y /= mag;
+			}
+			ch.dir = newDir;
+			if (ch.isBot && !ch.isOffTerritory && Math.random() < BOT_EXIT_PROB) {
+				ch.isOffTerritory = true;
+				ch.trail = [{ x: ch.pos.x, y: ch.pos.y }];
+			}
+		}
+
+		// --- Determine Safety ---
+		let safe;
+		if (ch === player) {
+			// For the player, safe if inside any of the player's territory.
+			safe = false;
+			for (let poly of ch.territory) {
+				if (pointInPolygon(ch.pos, poly)) {
+					safe = true;
+					break;
+				}
+			}
+		} else {
+			// For bots, check if the bot is in its own territory...
+			let inOwn = false;
+			for (let poly of ch.territory) {
+				if (pointInPolygon(ch.pos, poly)) {
+					inOwn = true;
+					break;
+				}
+			}
+			// ...and check if the bot is inside the player's territory.
+			let inPlayers = false;
+			for (let poly of player.territory) {
+				if (pointInPolygon(ch.pos, poly)) {
+					inPlayers = true;
+					break;
+				}
+			}
+			// Modification: if the bot's head is in the player's territory, mark it as not safe.
+			if (inPlayers) {
+				safe = false;
+			} else {
+				safe = inOwn;
+			}
+		}
+
+		// --- Territory / Trail Logic ---
+		if (safe) {
+			if (ch.isOffTerritory) {
+				if (ch.trail.length > MIN_TRAIL_POINTS_FOR_UNION &&
+					performance.now() - ch.lastUnionTime > UNION_COOLDOWN) {
+						let newPoly = ch.trail.slice();
+						// Ensure the trail is a closed polygon.
+							if (newPoly[0].x !== newPoly[newPoly.length - 1].x ||
+							newPoly[0].y !== newPoly[newPoly.length - 1].y) {
+								newPoly.push({ x: newPoly[0].x, y: newPoly[0].y });
+							}
+							// Offload the union operation to the Web Worker.
+							unionPolygonsAsync(ch.territory, newPoly).then((result) => {
+								ch.territory = result;
+								let allChars = [player].concat(bots);
+								for (let other of allChars) {
+									if (other !== ch) {
+										// Use window.differencePolygons so that it's available in the callback.
+										other.territory = window.differencePolygons(other.territory, [newPoly]);
+									}
+								}
+								ch.lastUnionTime = performance.now();
+							});
+					}
+				ch.trail = [];
+				ch.isOffTerritory = false;
+			}
+	} else {
+		if (!ch.isOffTerritory) {
+			ch.isOffTerritory = true;
+			ch.trail = [];
+			ch.trail.push({ x: ch.pos.x, y: ch.pos.y });
+		} else {
+			ch.trail.push({ x: ch.pos.x, y: ch.pos.y });
+			for (let i = 0; i < ch.trail.length - TRAIL_IGNORE_COUNT; i++) {
+				let pt = ch.trail[i];
+				if (Math.hypot(ch.pos.x - pt.x, ch.pos.y - pt.y) < COLLISION_THRESHOLD) {
+					ch.alive = false;
+					break;
+				}
+			}
+		}
+	}
+
+	// --- Cross–Trail Collision Check ---
+	if (!safe && ch.alive) {
+		let collisionHandled = false;
+		let allCharacters = [player].concat(bots);
+		for (let other of allCharacters) {
+			if (other === ch) continue;
+			if (other.trail.length > TRAIL_IGNORE_COUNT) {
+				for (let i = 0; i < other.trail.length - TRAIL_IGNORE_COUNT; i++) {
+					let pt = other.trail[i];
+					if (Math.hypot(ch.pos.x - pt.x, ch.pos.y - pt.y) < COLLISION_THRESHOLD) {
+						if (!collisionHandled) {
+							if (ch === player && other.isBot && !other.killed) {
+								other.alive = false;
+								other.killed = true;
+								collisionHandled = true;
+								player.kills++;
+								player.speed = PLAYER_SPEED + player.kills * 10;
+							} else if (ch.isBot && other === player) {
+								other.alive = false;
+								collisionHandled = true;
+							} else if (ch.isBot && other.isBot && !other.killed) {
+								other.alive = false;
+								other.killed = true;
+								collisionHandled = true;
+							}
+						}
+					break;
+					}
+				}
+				if (collisionHandled) break;
+			}
+		}
+	}
+}
+
+      // ===== DRAWING FUNCTIONS =====
+      function drawPlot(ch) {
+        ctx.fillStyle = ch.color;
+        ch.territory.forEach(poly => {
+          ctx.beginPath();
+          ctx.moveTo(poly[0].x, poly[0].y);
+          for (let i = 1; i < poly.length; i++) {
+            ctx.lineTo(poly[i].x, poly[i].y);
+          }
+          ctx.closePath();
+          ctx.fill("evenodd");
+        });
+      }
+
+      function drawCharacterElements(ch) {
+        if (ch.trail.length > 0) {
+          ctx.beginPath();
+          ctx.moveTo(ch.trail[0].x, ch.trail[0].y);
+          for (let i = 1; i < ch.trail.length; i++) {
+            ctx.lineTo(ch.trail[i].x, ch.trail[i].y);
+          }
+          ctx.strokeStyle = hexToRgba(ch.color, TRAIL_ALPHA);
+          ctx.lineWidth = TRAIL_WIDTH;
+          ctx.stroke();
+        }
+        ctx.beginPath();
+        ctx.arc(ch.pos.x, ch.pos.y, 10, 0, 2 * Math.PI);
+        ctx.fillStyle = ch.color;
+        ctx.fill();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = "white";
+        ctx.stroke();
+        ctx.strokeStyle = "black";
+        ctx.stroke();
+        drawNameTag(ch);
+      }
+
+      function drawNameTag(ch) {
+        ctx.font = "14px sans-serif";
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = "white";
+        ctx.strokeText(ch.name, ch.pos.x, ch.pos.y - 15);
+        ctx.strokeStyle = "black";
+        ctx.strokeText(ch.name, ch.pos.x, ch.pos.y - 15);
+        ctx.fillStyle = "black";
+        ctx.fillText(ch.name, ch.pos.x, ch.pos.y - 15);
+      }
+
+      function updateScoreboard() {
+        const scoreboard = document.getElementById("scoreboard");
+        let totalMapArea = Math.PI * MAP_RADIUS * MAP_RADIUS;
+        let allChars = [player].concat(bots);
+        allChars.sort((a, b) => totalClaimedArea(b) - totalClaimedArea(a));
+        let html = "";
+        allChars.forEach(ch => {
+          if (ch.alive) {
+            let pct = ((totalClaimedArea(ch) / totalMapArea) * 100).toFixed(1);
+            html += ch.name + " (" + pct + "%)<br/>";
+          }
+        });
+        scoreboard.innerHTML = html;
+      }
+
+      function updateKillCounter() {
+        const killCounter = document.getElementById("killCounter");
+        killCounter.innerHTML = "Kills: " + player.kills;
+      }
+
+      function updateMiniMap() {
+        const mini = document.getElementById("minimap");
+        miniCtx.clearRect(0, 0, mini.width, mini.height);
+        const scale = mini.width / (MAP_RADIUS * 2);
+        miniCtx.beginPath();
+        miniCtx.arc(mini.width/2, mini.height/2, MAP_RADIUS * scale, 0, 2 * Math.PI);
+        miniCtx.fillStyle = "white";
+        miniCtx.fill();
+        miniCtx.lineWidth = 2;
+        miniCtx.strokeStyle = "black";
+        miniCtx.stroke();
+        [player].concat(bots).forEach(ch => {
+          if (ch.alive) {
+            miniCtx.fillStyle = ch.color;
+            ch.territory.forEach(poly => {
+              miniCtx.beginPath();
+              poly.forEach((pt, i) => {
+                let x = (pt.x + MAP_RADIUS) * scale;
+                let y = (pt.y + MAP_RADIUS) * scale;
+                if (i === 0) miniCtx.moveTo(x, y);
+                else miniCtx.lineTo(x, y);
+              });
+              miniCtx.closePath();
+              miniCtx.fill();
+            });
+            miniCtx.beginPath();
+            let hx = (ch.pos.x + MAP_RADIUS) * scale;
+            let hy = (ch.pos.y + MAP_RADIUS) * scale;
+            miniCtx.arc(hx, hy, 5, 0, 2 * Math.PI);
+            miniCtx.fillStyle = "#000";
+            miniCtx.fill();
+          }
+        });
+      }
+
+      function draw() {
+        ctx.fillStyle = "blue";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.save();
+        ctx.translate(canvas.width/2 - player.pos.x, canvas.height/2 - player.pos.y);
+        ctx.beginPath();
+        ctx.arc(0, 0, MAP_RADIUS, 0, 2 * Math.PI);
+        ctx.fillStyle = "white";
+        ctx.fill();
+        ctx.lineWidth = 5;
+        ctx.strokeStyle = "#EEE";
+        ctx.stroke();
+        [player].concat(bots).forEach(ch => { if(ch.alive) drawPlot(ch); });
+        [player].concat(bots).forEach(ch => { if(ch.alive) drawCharacterElements(ch); });
+        ctx.restore();
+        updateScoreboard();
+        updateMiniMap();
+        updateKillCounter();
+        if (!player.alive) {
+          ctx.fillStyle = "red";
+          ctx.font = "48px sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillText("Game Over", canvas.width/2, canvas.height/2);
+          document.getElementById("restartButton").style.display = "block";
+        }
+        if (gameWon) {
+          ctx.fillStyle = "green";
+          ctx.font = "48px sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillText("You Win!", canvas.width/2, canvas.height/2);
+        }
+      }
+
+      function attachInputListeners() {
+        canvas.addEventListener("mousedown", (e) => {
+          const rect = canvas.getBoundingClientRect();
+          updateDirection(e.clientX - rect.left, e.clientY - rect.top);
+        });
+        canvas.addEventListener("touchstart", (e) => {
+          const rect = canvas.getBoundingClientRect();
+          let touch = e.touches[0];
+          updateDirection(touch.clientX - rect.left, touch.clientY - rect.top);
+        });
+        canvas.addEventListener("touchmove", (e) => {
+          const rect = canvas.getBoundingClientRect();
+          let touch = e.touches[0];
+          updateDirection(touch.clientX - rect.left, touch.clientY - rect.top);
+        });
+        window.addEventListener("resize", () => {
+          if (canvas) {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+          }
+        });
+      }
+
+      function updateDirection(x, y) {
+        const centerX = canvas.width/2;
+        const centerY = canvas.height/2;
+        const dx = x - centerX;
+        const dy = y - centerY;
+        const mag = Math.hypot(dx, dy);
+        if (mag > 0) player.dir = { x: dx / mag, y: dy / mag };
+      }
+
+      function gameLoop(time) {
+        let dt = (time - lastTime) / 1000;
+        lastTime = time;
+        if (player.alive && !gameWon) {
+          updateCharacter(player, dt);
+          bots.forEach(bot => { if (bot.alive) updateCharacter(bot, dt); });
+        }
+        draw();
+        if (player.alive && !gameWon) requestAnimationFrame(gameLoop);
+      }
+
+      function init() {
+        canvas = document.getElementById("gameCanvas");
+        ctx = canvas.getContext("2d");
+        miniCtx = document.getElementById("minimap").getContext("2d");
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        attachInputListeners();
+        player.pos = getRandomStartingPosition();
+        player.color = getRandomColor();
+        player.territory = [createCirclePolygon(player.pos, INITIAL_PLOT_RADIUS, CIRCLE_SEGMENTS)];
+        player.dir = directions[Math.floor(Math.random() * directions.length)] || { x: 1, y: 0 };
+        player.lastUnionTime = performance.now();
+        player.kills = 0;
+        bots = [];
+        for (let i = 0; i < BOT_COUNT; i++) {
+          let bot = {
+            pos: getRandomStartingPosition(),
+            dir: { x: 0, y: 0 },
+            speed: PLAYER_SPEED * (0.8 + Math.random() * 0.4),
+            territory: [],
+            trail: [],
+            isOffTerritory: false,
+            alive: true,
+            lastUnionTime: performance.now(),
+            isBot: true,
+            aiTimer: 1 + Math.random() * 2,
+            color: "",
+            hue: 0,
+            name: "Bot_" + (Math.floor(1000 + Math.random() * 9000)),
+            killed: false
+          };
+          let hue = Math.floor((360 / BOT_COUNT) * i);
+          bot.color = hslToHex(hue, 80, 50);
+          bot.hue = hue;
+          bot.territory = [createCirclePolygon(bot.pos, INITIAL_PLOT_RADIUS, CIRCLE_SEGMENTS)];
+          let angle = Math.random() * 2 * Math.PI;
+          bot.dir = { x: Math.cos(angle), y: Math.sin(angle) };
+          bots.push(bot);
+        }
+        lastTime = performance.now();
+        requestAnimationFrame(gameLoop);
+        checkForBotSpawn();
+        document.getElementById("restartButton").style.display = "none";
+      }
+
+      document.getElementById("restartButton").addEventListener("click", () => {
+        location.reload();
+      });
+
+      window.addEventListener("resize", () => {
+        if (canvas) {
+          canvas.width = window.innerWidth;
+          canvas.height = window.innerHeight;
+        }
+      });
+
+      window.onload = init;
+    </script>
+  </body>
+</html>
